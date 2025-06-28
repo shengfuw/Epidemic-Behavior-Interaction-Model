@@ -1,11 +1,12 @@
 import random
 import numpy as np
+import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter
-from joblib import Parallel, delayed
 from tqdm import tqdm
-import pandas as pd
+from joblib import Parallel, delayed
+from scipy.fft import fft, fftfreq
+from scipy.ndimage import gaussian_filter
 
 class Node: 
 
@@ -29,9 +30,9 @@ class Node:
         self.physical_neighbors = []
         self.virtual_neighbors = []
 
+        # self.aware_therold = 0.4
         # self.aware_therold = np.random.uniform(0.05, 0.95)
         # self.aware_therold = np.random.normal(0.5, 0.25)
-        # self.aware_therold = 0.4
         self.aware_therold = np.random.beta(a, b)
 
         self.infected_time = -1
@@ -122,6 +123,13 @@ class TwoLayerNetwork:
         - infection_period (int): Duration of the infection period.
         - gamma (float): Probability of rewiring the physical network.
         - eta (float): Probability of rewiring to a neighbor of a neighbor.
+        - threshold_formula (str): "simple" or "complex".
+        - psi (float): Transmission probability for aware nodes in the simple contagion model.
+        - lambda_ (float): Rate of change in the awareness threshold.
+        - rho (float): Rate of change in the awareness threshold.
+        - network_type (str): Type of the physical network: "ER", "BA", or "WS".
+        - initial_infected_ratio (float): Initial fraction of infected nodes.
+        - intial_aware_ratio (float): Initial fraction of aware nodes.
         """
         # Create N nodes 
         self.nodes = [Node(node_id=i, a=a, b=b, gamma=gamma, eta=eta) for i in range(N)]
@@ -154,9 +162,8 @@ class TwoLayerNetwork:
         
         self.create_physical_network(G)
 
-        # Rewire the network by performing double edge swaps
-        # num_swaps = int((1-overlap_percentage) * G.number_of_edges())
-        # nx.double_edge_swap(G, nswap=num_swaps)
+        # Create the virtual network by copying the physical network
+        # nx.double_edge_swap(G, nswap=int((1-overlap_percentage)) # rewire the network by performing double edge swaps
         self.create_virtual_network(G)
 
         # Set the parameters of the model
@@ -180,12 +187,14 @@ class TwoLayerNetwork:
         if self.rho == 0:
             self.rho = 0.01
         
+        self.initial_infected_ratio = initial_infected_ratio
+        self.intial_aware_ratio = intial_aware_ratio
+        self.network_type = network_type
+
         self.round = 0
         self.rewiring_count = 0
-
         self.infection_counts = [self.count_infected()]
         self.awreness_counts = [self.count_aware()]
-        
         self.adjust_awareness_thresholds = [] # for recording the adjusted awareness thresholds
 
     def create_physical_network(self, G):
@@ -306,9 +315,9 @@ class TwoLayerNetwork:
     def count_aware(self):
         return sum(node.state_awareness == 1 for node in self.nodes)
     
+    
     def update_one_round(self):
         self.round += 1
-    
         self.adjust_awareness_thresholds = [] # for recording the adjusted awareness thresholds
 
         self.update_health_state()
@@ -326,12 +335,12 @@ class TwoLayerNetwork:
     
     def run_simulation(self, num_rounds, print_info=True, plot_network=True):
         if print_info: self.print_info()
-        for t in range(num_rounds):
-            pi = self.count_infected() / len(self.nodes)
 
+        for t in range(num_rounds):
             self.update_one_round()
             
             if plot_network and (t % 300 == 0):
+                pi = self.count_infected() / len(self.nodes)
                 print(f"Time step: {self.round}")
                 print(f"Awareness count: {self.count_aware()}")
                 plt.figure(figsize=(3, 2))
@@ -339,8 +348,8 @@ class TwoLayerNetwork:
                 plt.xlim(0, 1) 
                 plt.title(f'Global Infection rate={pi:.2f}')
                 plt.show()
-
                 self.plot_network("physical")
+
         if print_info: self.print_info()
 
 
@@ -416,25 +425,29 @@ class TwoLayerNetwork:
         print('-'*30)
 
 
-    def plot_prevalence_trend(self, ax=None):
+    def plot_prevalence_trend(self, ax=None, subplot_label=None):
         time_steps = self.round
         infection_proportion = np.array(self.infection_counts) / self.N
         awareness_proportion = np.array(self.awreness_counts) / self.N
-        
+
         if ax is None:
-            fig, ax = plt.subplots(figsize=(10, 7))  # Create a new figure if no axes provided
-        ax.plot(range(time_steps+1), infection_proportion, label='I: Infected population')
-        ax.plot(range(time_steps+1), awareness_proportion, label='A: Adopting population', color='orange')
+            fig, ax = plt.subplots(figsize=(10, 7))  # Create new figure if no axes provided
 
-        # ax.title('EBIM: SIS + NAN Model')
-        ax.set_xlabel('Time step (Iteration)')
-        ax.set_ylabel('Percentage of agents')
-        ax.legend()
+        ax.plot(range(time_steps+1), infection_proportion, label=r"$I$: Infected", color='C0', lw=2)
+        ax.plot(range(time_steps+1), awareness_proportion, label=r"$A$: Adopting", color='C1', lw=2)
+
+        ax.set_xlabel(r"Time step $t$")
+        ax.set_ylabel("Proportion of Agents")
         ax.set_ylim(-0.05, 1.05)
-        # if ax.figure:
-        #     plt.show()
+        ax.legend(frameon=False, loc='lower right', fontsize=10)
 
-    def get_statistics(self, type, window_size=500):
+        # Add subplot label (a), (b), ...
+        if subplot_label:
+            ax.text(-0.1, 1.05, f"({subplot_label})", transform=ax.transAxes,
+                    fontsize=14, fontweight='bold', va='top', ha='right')
+
+
+    def get_statistics(self, type, window_size=1000):
         if type == "infection":
             y = np.array(self.infection_counts) / self.N
         elif type == "awareness":
@@ -444,27 +457,38 @@ class TwoLayerNetwork:
         
         last_segment = y[-window_size:]
 
-        # amplitu: Max-Min
-        amplitude = last_segment.max() - last_segment.min()
-        
-        # standard deviation
-        std = last_segment.std()
+        # 1. navie version
+        amplitude = last_segment.max() - last_segment.min() # amplitude: Max-Min
+        std = last_segment.std() # standard deviation
 
-        # average the last 10 time steps
-        average = y[-10:].mean()   
+        # 2. fourier analysis
+        seq_freq, seq_amp = fourier_analysis(last_segment, window_size)
 
-        return y[-1], average, amplitude, std
+        # final size/prevalence: average the last 10 time steps
+        rate = y[-10:].mean()   
+
+        return y[-1], rate, amplitude, std, seq_freq, seq_amp
     
-def plot_heatmap(data, title, fig=None, ax=None, cmap='inferno', sigma=1.5):
+def fourier_analysis(data, t): # Spectral Analysis
+    data_fft = fft(data) # Fast Fourier Transform
+    freq = fftfreq(t, 1)
+    mask = freq > 0
+    freq_pos = freq[mask]
+    fft_magnitude = np.abs(data_fft[mask]) * 2 / t # scale for amplitude estimation
 
-    smoothed_data = gaussian_filter(data, sigma=sigma) # Apply Gaussian smoothing
+    # Identify the dominant frequency and its amplitude
+    dominant_idx = np.argmax(fft_magnitude)
+    dominant_freq = freq_pos[dominant_idx]
+    dominant_amp = fft_magnitude[dominant_idx]
 
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 6))  # Create a new figure if no axes provided
+    return dominant_freq, dominant_amp
 
-    im = ax.imshow(smoothed_data, extent=[0, 1, 0, 1], origin='lower', aspect='auto', cmap=cmap)
-    fig.colorbar(im, ax=ax, label=title)  
-    ax.set_title("Heatmap of " + title)
-    ax.set_xlabel('Lambda (λ)')
-    ax.set_ylabel('Rho (ρ)')
-    return im
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.size': 14,
+    'axes.labelsize': 14,
+    'xtick.labelsize': 12,
+    'ytick.labelsize': 12,
+    'legend.fontsize': 12,
+    'mathtext.fontset': 'cm',
+})
