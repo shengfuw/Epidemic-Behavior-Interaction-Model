@@ -99,7 +99,7 @@ class Node:
                 # print(self.id, neighbor.id, [n.id for n in list(new_links_pool)], [n.id for n in all_susceptible_nodes])
 
                 if len(new_links_pool) > 0:
-                    new_neighbor = random.choice(list(new_links_pool))
+                    new_neighbor = random.choice(sorted(new_links_pool, key=lambda n: n.id)) # sort by id so seeded runs are reproducible
                     self.add_physical_neighbor(new_neighbor)
                     new_neighbor.add_physical_neighbor(self)
 
@@ -110,7 +110,7 @@ class Node:
         return 0
 
 class TwoLayerNetwork:
-    def __init__(self, N, k, a, b, beta_a, beta_u, alpha, infection_period, gamma, eta, threshold_formula, psi="", lambda_="", rho="", network_type="ER", initial_infected_ratio=0.01, intial_aware_ratio=0.1):
+    def __init__(self, N, k, a, b, beta_a, beta_u, alpha, infection_period, gamma, eta, threshold_formula, psi="", lambda_="", rho="", network_type="ER", initial_infected_ratio=0.01, intial_aware_ratio=0.1, ws_p=0.1):
         """
         Initialize a two-layer network with N nodes in each layer.
 
@@ -123,13 +123,14 @@ class TwoLayerNetwork:
         - infection_period (int): Duration of the infection period.
         - gamma (float): Probability of rewiring the physical network.
         - eta (float): Probability of rewiring to a neighbor of a neighbor.
-        - threshold_formula (str): "simple" or "complex".
+        - threshold_formula (str): "simple", "simple_prevalence", or "complex".
         - psi (float): Transmission probability for aware nodes in the simple contagion model.
         - lambda_ (float): Rate of change in the awareness threshold.
         - rho (float): Rate of change in the awareness threshold.
         - network_type (str): Type of the physical network: "ER", "BA", or "WS".
         - initial_infected_ratio (float): Initial fraction of infected nodes.
         - intial_aware_ratio (float): Initial fraction of aware nodes.
+        - ws_p (float): Rewiring probability of the Watts-Strogatz network.
         """
         # Create N nodes 
         self.nodes = [Node(node_id=i, a=a, b=b, gamma=gamma, eta=eta) for i in range(N)]
@@ -149,14 +150,14 @@ class TwoLayerNetwork:
         for node in self.nodes:
             node.update_to_new_state()
 
-        # Create the physical network
+        # Create the physical network (k is the mean degree for every network type)
         p = k/N
         if network_type == "ER":
             G = nx.erdos_renyi_graph(n=N, p=p)
         elif network_type == "BA":
-            G = nx.barabasi_albert_graph(n=N, m=k)
+            G = nx.barabasi_albert_graph(n=N, m=k//2) # mean degree ~ 2m
         elif network_type == "WS":
-            G = nx.connected_watts_strogatz_graph(n=N, k=k, p=0.5)
+            G = nx.connected_watts_strogatz_graph(n=N, k=k, p=ws_p) # k//2 neighbors on each side
         else:
             raise ValueError("Invalid network type. Choose 'ER', 'BA', or 'WS'.")
         
@@ -190,6 +191,7 @@ class TwoLayerNetwork:
         self.initial_infected_ratio = initial_infected_ratio
         self.intial_aware_ratio = intial_aware_ratio
         self.network_type = network_type
+        self.ws_p = ws_p
 
         self.round = 0
         self.rewiring_count = 0
@@ -249,7 +251,12 @@ class TwoLayerNetwork:
         """
         Update the awareness state of each node in the network.
         """
-        if self.threshold_formula == "simple": # simple contagion
+        if self.threshold_formula in ("simple", "simple_prevalence"): # simple contagion
+            psi_t = self.psi
+            if self.threshold_formula == "simple_prevalence": # adoption probability rises with the previous-step prevalence
+                global_infection_rate = self.count_infected() / len(self.nodes)
+                psi_t = min(1, self.psi / max(1 - self.lambda_*global_infection_rate, 1e-9))
+
             for node in random.sample(self.nodes, len(self.nodes)):
             # If the node is unaware: U -> A
                 if node.state_awareness == 0: 
@@ -257,7 +264,7 @@ class TwoLayerNetwork:
                     num_awared_neighbors = sum([neighbor.state_awareness == 1 for neighbor in node.virtual_neighbors])
 
                     # 2. calculate the probability of transmission
-                    transmission_prob = 1 - (1 - self.psi) ** num_awared_neighbors
+                    transmission_prob = 1 - (1 - psi_t) ** num_awared_neighbors
 
                     # 3. set the state of the node to awared with probability 'transmission_prob'
                     if np.random.rand() < transmission_prob:
